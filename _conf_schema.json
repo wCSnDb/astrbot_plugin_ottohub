@@ -1,0 +1,74 @@
+{
+  "reply_in_dm": {
+    "type": "bool",
+    "description": "私信回复",
+    "default": true,
+    "hint": "是否回复私信消息"
+  },
+  "reply_in_blog_comments": {
+    "type": "bool",
+    "description": "博客评论回复",
+    "default": true,
+    "hint": "是否回复博客评论"
+  },
+  "reply_in_video_comments": {
+    "type": "bool",
+    "description": "视频评论回复",
+    "default": true,
+    "hint": "是否回复视频评论"
+  },
+  "include_post_comment_count": {
+    "type": "bool",
+    "description": "包含帖子评论数",
+    "default": true,
+    "hint": "上下文是否包含帖子评论数"
+  },
+  "include_post_like_count": {
+    "type": "bool",
+    "description": "包含帖子点赞数",
+    "default": true,
+    "hint": "上下文是否包含帖子点赞数"
+  },
+  "include_post_cold_count": {
+    "type": "bool",
+    "description": "包含帖子冷启动数",
+    "default": true,
+    "hint": "上下文是否包含帖子冷启动数"
+  },
+  "include_post_view_count": {
+    "type": "bool",
+    "description": "包含帖子阅读数",
+    "default": true,
+    "hint": "上下文是否包含帖子阅读数"
+  },
+  "image_upload_validate": {
+    "type": "bool",
+    "description": "校验图片上传结果",
+    "default": true,
+    "hint": "是否自动校验图片上传状态"
+  },
+  "image_upload_attempts": {
+    "type": "int",
+    "description": "图片上传尝试次数",
+    "default": 3,
+    "hint": "上传失败重试最大次数"
+  },
+  "image_upload_check_delay_seconds": {
+    "type": "int",
+    "description": "上传后校验等待秒数",
+    "default": 5,
+    "hint": "上传后等待多少秒再校验状态"
+  },
+  "image_upload_retry_delay_seconds": {
+    "type": "int",
+    "description": "失败后重试等待秒数",
+    "default": 5,
+    "hint": "重试上传前等待多少秒"
+  },
+  "dedupe_post_context": {
+    "type": "bool",
+    "description": "同会话帖子上下文去重",
+    "default": true,
+    "hint": "同一帖子上下文的去重处理"
+  }
+}
