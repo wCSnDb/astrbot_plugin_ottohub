@@ -1,39 +1,32 @@
 # AstrBot OttoHub Adapter (astrbot_plugin_ottohub)
 
 AstrBot 的 OttoHub 平台适配器插件，支持将 AstrBot 接入到 OttoHub 机器人平台。
+这算是我做了比较久的一个项目，目前因为不知道怎么上传到Astrbot的官方插件仓库，因此就没上传。
+本来是专门为了typer[（点击去typer主页）](https://www.ottohub.cn/u/20032)而制作的一个插件，但是后来因为个人意愿而将其放出。
 
-## ✨ 功能特性
-
-- **平台接入**：提供完整的适配器和客户端实现，无缝对接 OttoHub 平台。
-- **消息过滤与清洗**：自动剔除冗余的 `[图片]` 占位符、清理外部 OCR 识别产生的垃圾文本。
-- **LLM 预处理**：支持在发送给大语言模型（LLM）前重写 Prompt，以及自定义系统提示词（System Prompt）和回复限制提示词。
-- **配置项过滤**：仅在选择 OttoHub 平台时展示相关登录凭证（如 `cookie_json` 和 `user_agent`），界面整洁易用。
-
-## 📥 安装方法
-
-### 方式一：从链接安装（推荐）
-1. 打开 AstrBot WebUI，导航到 **插件** -> **安装插件**。
-2. 选择 **从链接安装**。
-3. 输入本仓库的 Git 地址：
+## 安装方法：
+一：从链接安装
+1. 在AstrBot的WebUI里：
+2. 找到侧边栏的插件
+3. 然后点下面的AstrBot 插件
+4. 接着点击右下角的那个加号
+5. 在弹出的菜单内点击链接安装然后填入下面的url，即可安装插件。
    ```text
    https://github.com/wCsNDb/astrbot_plugin_ottohub
    ```
-4. 点击确定，等待安装完成并重载插件即可。
 
-### 方式二：手动安装
+二：手动安装
 1. 克隆本仓库到 AstrBot 的插件目录：
    ```bash
    cd AstrBot/data/plugins
    git clone https://github.com/wCsNDb/astrbot_plugin_ottohub.git
    ```
-2. 重启 AstrBot 或在 WebUI 中重载插件。
+2. 重启AstrBot。
 
-## ⚙️ 配置说明
+## 配置：
 
-在 AstrBot WebUI 的设置或添加机器人页面中：
-- 填入您的 `cookie_json` 和 `user_agent` 凭证进行登录对接。
-- 支持在设置页面中配置提示词相关的行为控制。
+在AstrBot WebUI的添加机器人页面中：
+- 填写cookie_json（你的ottohub的cookies（json格式））和user_agent（这个暂时不用管）凭证进行登录对接。
+- 你可以在设置页面中配置相关的设置，比如说图片上传和信息附带、回复处等。
 
-## 📄 开源协议
-
-本项目基于 [GPL-3.0](LICENSE) 协议开源。
+别的我也没什么可以说的了，如果有bug可以给我汇报[点击查看到我的主页](https://www.ottohub.cn/u/7510)
