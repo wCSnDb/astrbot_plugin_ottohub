@@ -36,4 +36,4 @@ AstrBot 的 OttoHub 平台适配器插件，支持将 AstrBot 接入到 OttoHub 
 
 ## 📄 开源协议
 
-本项目基于 [MIT](LICENSE) 协议开源。
+本项目基于 [GPL-3.0](LICENSE) 协议开源。
