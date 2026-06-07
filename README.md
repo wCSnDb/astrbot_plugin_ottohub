@@ -5,15 +5,9 @@ AstrBot 的 OttoHub 平台适配器插件，支持将 AstrBot 接入到 OttoHub 
 本来是专门为了typer[（点击去typer主页）](https://www.ottohub.cn/u/20032)而制作的一个插件，但是后来因为个人意愿而将其放出。
 
 ## 安装方法：
-一：从链接安装
-1. 在AstrBot的WebUI里：
-2. 找到侧边栏的插件
-3. 然后点下面的AstrBot 插件
-4. 接着点击右下角的那个加号
-5. 在弹出的菜单内点击链接安装然后填入下面的url，即可安装插件。
-   ```text
-   https://github.com/wCsNDb/astrbot_plugin_ottohub
-   ```
+一：Astrbot 插件市场安装：
+1. 打开 Astrbot 插件市场页面
+2. 点击安装
 
 二：手动安装
 1. 克隆本仓库到 AstrBot 的插件目录：
