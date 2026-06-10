@@ -97,7 +97,7 @@ class OttoHubPlatformAdapter(Platform):
         self.sent_post_context_keys: dict[str, float] = {}
         self.post_context_dedupe_path = Path("data/config/astrbot_plugin_ottohub_post_context_dedupe.json")
         self._load_post_context_dedupe()
-        logger.info("[OttoHub] 适配器初始化完成")
+        logger.info("[OttoHub] 初始化完成")
 
     # ------------------------------------------------------------------ helpers
 
@@ -145,9 +145,9 @@ class OttoHubPlatformAdapter(Platform):
                         for key, value in data.items()
                         if isinstance(value, (int, float))
                     }
-                    logger.info("[OttoHub] 已加载 %d 条帖子上下文去重记录", len(self.sent_post_context_keys))
+                    logger.info("[OttoHub] 加载上下文去重 %d 条", len(self.sent_post_context_keys))
         except Exception as exc:
-            logger.warning("[OttoHub] 加载帖子上下文去重记录失败: %s", exc)
+            logger.warning("[OttoHub] 加载上下文去重失败: %s", exc)
 
     def _save_post_context_dedupe(self) -> None:
         try:
@@ -159,7 +159,7 @@ class OttoHubPlatformAdapter(Platform):
             )
             tmp_path.replace(self.post_context_dedupe_path)
         except Exception as exc:
-            logger.warning("[OttoHub] 保存帖子上下文去重记录失败: %s", exc)
+            logger.warning("[OttoHub] 保存上下文去重失败: %s", exc)
 
     # ------------------------------------------------------------------ text utilities
 
@@ -423,7 +423,7 @@ class OttoHubPlatformAdapter(Platform):
             if best_uid_match:
                 return best_uid_match
         except Exception as exc:
-            logger.error("[OttoHub] 评论解析失败: %s", exc, exc_info=True)
+            logger.error("[OttoHub] 评论解析异常: %s", exc, exc_info=True)
         fallback_parent = n.tid if n.tid else 0
         return ResolvedComment(n.rc, self._extract_images(n.rc), n.tid, fallback_parent, matched=False)
 
@@ -547,7 +547,7 @@ class OttoHubPlatformAdapter(Platform):
                     valid.append(url)
             else:
                 invalid.append(url)
-                logger.warning("[OttoHub] 图片不可达，已丢弃: %s", url)
+                logger.debug("[OttoHub] 图片不可达: %s", url)
         return valid, invalid
 
     # ------------------------------------------------------------------ prompt building
@@ -703,7 +703,7 @@ class OttoHubPlatformAdapter(Platform):
             img.save(_PLACEHOLDER_IMAGE_PATH)
             return True
         except Exception as exc:
-            logger.warning("[OttoHub] 创建图片占位图失败: %s", exc)
+            logger.debug("[OttoHub] 占位图创建失败: %s", exc)
             return False
 
     # ------------------------------------------------------------------ message processing
@@ -718,7 +718,7 @@ class OttoHubPlatformAdapter(Platform):
         self.processed_ids.add(mk)
         rc = str(msg.get("content") or "")
         suid = str(msg.get("sender") or "0")
-        logger.debug("[OttoHub] 收到原始消息 msg_id=%s: %s", mk, msg)
+        logger.info("[OttoHub] 收到通知: %s", msg)
 
         kind = "dm"
         pid = 0
@@ -757,10 +757,7 @@ class OttoHubPlatformAdapter(Platform):
 
         resolved = await self._resolve_comment(parsed)
         if self._seen_comment_key(kind, pid, resolved.comment_id):
-            logger.info(
-                "[OttoHub] 跳过重复通知 kind=%s post_id=%s comment_id=%s msg_id=%s",
-                kind, pid, resolved.comment_id, mid,
-            )
+            logger.info("[OttoHub] 跳过重复 %s/%s comment=%s", kind, pid, resolved.comment_id)
             await self.client.mark_message_read(int(mid))
             return
 
@@ -774,10 +771,7 @@ class OttoHubPlatformAdapter(Platform):
         post = await self._post_context(kind, pid)
 
         if kind != "dm" and self._is_own_post_comment_reply(post, resolved) and tt != "at_mention":
-            logger.info(
-                "[OttoHub] 跳过自己帖子下的评论回复 kind=%s post_id=%s comment_id=%s msg_id=%s",
-                kind, pid, resolved.comment_id, mid,
-            )
+            logger.info("[OttoHub] 跳过自己帖子评论 %s/%s comment=%s", kind, pid, resolved.comment_id)
             await self.client.mark_message_read(int(mid))
             return
 
@@ -799,7 +793,7 @@ class OttoHubPlatformAdapter(Platform):
                         except Exception:
                             pass
         except Exception as exc:
-            logger.error("[OttoHub] 检查会话历史失败: %s", exc)
+            logger.warning("[OttoHub] 会话历史检查失败: %s", exc)
 
         is_reset = "/reset" in (user_text or "").lower() or "/reset" in (rc or "").lower()
         if is_reset:
@@ -807,11 +801,11 @@ class OttoHubPlatformAdapter(Platform):
             for k in keys_to_remove:
                 self.sent_post_context_keys.pop(k, None)
             self._save_post_context_dedupe()
-            logger.info("[OttoHub] 已清除会话 %s 的帖子上下文去重记录（reset 指令）", sid)
+            logger.info("[OttoHub] 会话 %s 上下文去重已重置", sid)
             include_post_context = True
         else:
             if history_is_empty:
-                logger.debug("[OttoHub] 会话 %s 历史为空，保留帖子上下文去重状态", sid)
+                logger.debug("[OttoHub] 会话 %s 历史为空", sid)
             include_post_context = self._should_include_post_context(sid, kind, pid, resolved.reply_parent_id, plugin_config)
 
         post_images = self._post_images(post) if include_post_context else []
@@ -896,10 +890,7 @@ class OttoHubPlatformAdapter(Platform):
         event.should_call_llm(False)
         self.commit_event(event)
         await self.client.mark_message_read(int(mid))
-        logger.info(
-            "[OttoHub] 已提交事件 kind=%s session=%s user=%s(%s) comment_id=%s",
-            kind, sid, sn, ruid, resolved.comment_id,
-        )
+        logger.info("[OttoHub] %s/%s %s(uid:%s) → comment=%s", kind, sid, sn, ruid, resolved.comment_id)
 
     # ------------------------------------------------------------------ main loop
 
@@ -911,7 +902,7 @@ class OttoHubPlatformAdapter(Platform):
             if isinstance(cookies, list):
                 cookies = {c["name"]: c["value"] for c in cookies if "name" in c and "value" in c}
         except Exception as exc:
-            logger.error("[OttoHub] cookie_json 解析失败: %s", exc)
+            logger.error("[OttoHub] Cookie解析失败: %s", exc)
             return
         plugin_config = self._load_plugin_config()
         self.client = OttoHubClient(
@@ -927,9 +918,9 @@ class OttoHubPlatformAdapter(Platform):
             resend_dedupe_ttl_seconds=self._config_value("resend_dedupe_ttl_seconds", 3600, plugin_config),
         )
         if await self.client.verify_session():
-            logger.info("[OttoHub] 登录成功，UID=%s", self.client.uid)
+            logger.info("[OttoHub] 已登录 uid=%s", self.client.uid)
         else:
-            logger.warning("[OttoHub] Session 验证失败，仍继续轮询")
+            logger.warning("[OttoHub] Session验证失败，继续轮询")
         while True:
             try:
                 messages = await self.client.get_unread_messages()
