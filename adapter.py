@@ -346,18 +346,27 @@ class OttoHubPlatformAdapter(Platform):
         root_id = self._comment_id(n.kind, root)
         if not root_id:
             return None
+        bot_uid = str(getattr(self.client, "uid", "") or "")
+        # Collect ALL matching children across pages and return the most recent one.
+        # Previously the first match was returned, which caused old comment IDs to be
+        # reused when the user sent a new comment in the same thread, triggering the
+        # duplicate-skip logic even though the new comment had never been processed.
+        best: ResolvedComment | None = None
         for offset in (0, 6):
             children = await self._get_comments(n.kind, n.pid, root_id, offset, 6)
             for child in children:
                 child_id = self._comment_id(n.kind, child)
                 child_uid = self._comment_uid(child)
+                # Never match the bot's own reply comments — they are responses, not triggers.
+                if bot_uid and child_uid == bot_uid:
+                    continue
                 text = self._comment_text(child)
                 id_match = n.tid and child_id == n.tid
                 uid_match = child_uid and child_uid == str(n.suid)
                 mention_match = n.tt == "at_mention" and self._mentions_bot(text)
                 if id_match or (uid_match and (not n.tid or mention_match or "回复" in n.rc)):
                     parent = self._nearest_previous_bot_child(children, child) or root
-                    return ResolvedComment(
+                    candidate = ResolvedComment(
                         text=text or n.rc,
                         images=self._extract_images(text),
                         comment_id=child_id,
@@ -369,9 +378,17 @@ class OttoHubPlatformAdapter(Platform):
                         matched=True,
                         comment_time=str(child.get("time") or ""),
                     )
+                    # Keep the most recent match (highest time string or largest ID)
+                    if best is None:
+                        best = candidate
+                    elif candidate.comment_time and best.comment_time:
+                        if candidate.comment_time > best.comment_time:
+                            best = candidate
+                    elif candidate.comment_id and best.comment_id and candidate.comment_id > best.comment_id:
+                        best = candidate
             if len(children) < 6:
                 break
-        return None
+        return best
 
     async def _resolve_comment(self, n: ParsedNotification) -> ResolvedComment:
         if n.kind == "dm" or not n.pid:
@@ -383,14 +400,21 @@ class OttoHubPlatformAdapter(Platform):
                 root_uid = self._comment_uid(root)
                 root_text = self._comment_text(root)
                 if root_id and n.tid and root_id == n.tid:
+                    # The notification BCID points directly at this root comment.
+                    # Find the user's newest child comment in it.
                     child = await self._find_matching_child(n, root)
                     if child:
                         return child
                     return ResolvedComment(root_text or n.rc, self._extract_images(root_text), root_id, root_id, matched=True, comment_time=str(root.get("time") or ""))
                 if root_uid == str(n.suid):
                     root_match = ResolvedComment(root_text or n.rc, self._extract_images(root_text), root_id, root_id, matched=True, comment_time=str(root.get("time") or ""))
-                    if n.tt == "at_mention" and self._mentions_bot(root_text):
-                        return root_match
+                    # When the notification has an explicit BCID (n.tid), do NOT short-circuit
+                    # on a uid-matching root comment — the user may have posted in a different
+                    # thread (n.tid) than their root comment. Keep iterating so we can find
+                    # root_id == n.tid first.
+                    if not n.tid:
+                        if n.tt == "at_mention" and self._mentions_bot(root_text):
+                            return root_match
                     if best_uid_match is None:
                         best_uid_match = root_match
                 child = await self._find_matching_child(n, root)
@@ -749,7 +773,7 @@ class OttoHubPlatformAdapter(Platform):
         relation = await self.client.get_bot_relationship(ruid)
         post = await self._post_context(kind, pid)
 
-        if kind != "dm" and self._is_own_post_comment_reply(post, resolved):
+        if kind != "dm" and self._is_own_post_comment_reply(post, resolved) and tt != "at_mention":
             logger.info(
                 "[OttoHub] 跳过自己帖子下的评论回复 kind=%s post_id=%s comment_id=%s msg_id=%s",
                 kind, pid, resolved.comment_id, mid,
