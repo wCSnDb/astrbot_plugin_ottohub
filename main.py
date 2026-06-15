@@ -1,15 +1,9 @@
-import re
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
-from .adapter import PLUGIN_CONFIG_PATH
 
-DEFAULT_OTTOHUB_REPLY_LIMIT_PROMPT = ""
-IMAGE_PLACEHOLDER_RE = re.compile(r"(?<![!\[])[ \t]*\[(?:图片|image)\][ \t]*(?!\()", re.I)
-TOOL_CALL_BLOCK_RE = re.compile(r"(?is)\b[a-zA-Z_][\w.:-]*\s*\n(?:\s*<arg_key>.*?</arg_key>\s*(?:\n\s*<arg_value>.*?</arg_value>\s*)?)+\s*(?:</tool_call>)?")
-TOOL_CALL_TAG_RE = re.compile(r"(?is)</?tool_call>|<arg_key>.*?</arg_key>|<arg_value>.*?</arg_value>")
+from .text_utils import sanitize_text, strip_data_images
 
 
 @register("Ottohub Adapter", "wcsndb", "OttoHub 适配器", "0.1.1")
@@ -17,47 +11,63 @@ class OttoHubPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
+
+        # 强制级联依赖：关闭上游开关时，同步关闭依赖它的高级选项并持久化到 WebUI。
+        # 配置可能是分组嵌套结构（WebUI 分组），故用 _cfg_get/_cfg_set 兼容扁平与嵌套两种布局。
+        changed = False
+        if not self._cfg_get("resend_failed_messages", False):
+            for key in ("resend_re_respond", "resend_delete_on_audit"):
+                if self._cfg_get(key, False):
+                    self._cfg_set(key, False)
+                    changed = True
+
+        if not self._cfg_get("reply_with_at", False) and self._cfg_get("use_effective_at", True):
+            self._cfg_set("use_effective_at", False)
+            changed = True
+
+        if changed:
+            try:
+                from astrbot.core.star.star import star_map
+                metadata = star_map.get(self.__class__.__module__)
+                if metadata and metadata.config:
+                    metadata.config.save_config(self.config)
+                    logger.info("[OttoHub] 级联开关触发，已关闭重新响应/自动删除/有效@等依赖选项并同步 WebUI")
+            except Exception as exc:
+                logger.warning("[OttoHub] 自动联动保存配置失败: %s", exc)
+
         from . import adapter
         adapter._SHARED_CONTEXT = context
         logger.debug("[OttoHub] 插件初始化完成，已共享 context")
 
     # ------------------------------------------------------------------ config helpers
 
-    def _load_plugin_config(self) -> dict:
-        try:
-            with PLUGIN_CONFIG_PATH.open(encoding="utf-8-sig") as f:
-                import json
-                return json.load(f)
-        except Exception:
-            return {}
+    def _cfg_get(self, key, default=None):
+        """读取配置项，兼容扁平键与 WebUI 分组嵌套布局。"""
+        if key in self.config:
+            return self.config.get(key, default)
+        for value in self.config.values():
+            if isinstance(value, dict) and key in value:
+                return value.get(key, default)
+        return default
 
-    def _config_text(self, key: str, default: str = "") -> str:
-        plugin_config = self._load_plugin_config()
-        value = plugin_config.get(key, self.config.get(key, default))
-        return str(value).strip() if value is not None else ""
+    def _cfg_set(self, key, new_value):
+        """写入配置项，命中分组内的键时就地更新，否则写到顶层。"""
+        if key in self.config:
+            self.config[key] = new_value
+            return
+        for value in self.config.values():
+            if isinstance(value, dict) and key in value:
+                value[key] = new_value
+                return
+        self.config[key] = new_value
 
-    # ------------------------------------------------------------------ text sanitization
-
-    @staticmethod
-    def _strip_image_placeholders(text: str) -> str:
-        cleaned = IMAGE_PLACEHOLDER_RE.sub(" ", str(text or ""))
-        return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
-
-    @classmethod
-    def _sanitize_text(cls, text: str) -> str:
-        cleaned = TOOL_CALL_BLOCK_RE.sub(" ", str(text or ""))
-        cleaned = TOOL_CALL_TAG_RE.sub(" ", cleaned)
-        cleaned = cls._strip_image_placeholders(cleaned)
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-        cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned.strip()
+    # ------------------------------------------------------------------ LLM 请求清洗
 
     def _sanitize_llm_value(self, value, *, remove_images: bool = False):
         if isinstance(value, str):
             if remove_images:
-                value = re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "", value)
-            return self._sanitize_text(value)
+                value = strip_data_images(value)
+            return sanitize_text(value)
         if isinstance(value, list):
             cleaned = []
             for item in value:
@@ -79,50 +89,11 @@ class OttoHubPlugin(Star):
                     item = getattr(value, attr)
                     if isinstance(item, str):
                         if remove_images:
-                            item = re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "", item)
-                        setattr(value, attr, self._sanitize_text(item))
+                            item = strip_data_images(item)
+                        setattr(value, attr, sanitize_text(item))
                 except Exception:
                     pass
         return value
-
-    # ------------------------------------------------------------------ OCR garbage cleanup
-
-    def _clean_external_ocr_garbage(self, req: ProviderRequest) -> None:
-        if req.extra_user_content_parts:
-            cleaned_parts = []
-            for part in req.extra_user_content_parts:
-                text_val = ""
-                if hasattr(part, "text"):
-                    text_val = getattr(part, "text") or ""
-                elif isinstance(part, dict) and "text" in part:
-                    text_val = part["text"] or ""
-                if isinstance(text_val, str) and ("Image Attachment" in text_val):
-                    continue
-                cleaned_parts.append(part)
-            req.extra_user_content_parts = cleaned_parts
-
-        if req.contexts:
-            cleaned_contexts = []
-            for msg in req.contexts:
-                if not isinstance(msg, dict):
-                    cleaned_contexts.append(msg)
-                    continue
-                content = msg.get("content")
-                if isinstance(content, list):
-                    cleaned_content = []
-                    for part in content:
-                        if isinstance(part, dict):
-                            text_val = part.get("text") or ""
-                            if part.get("type") == "text" and isinstance(text_val, str) and "Image Attachment" in text_val:
-                                continue
-                        cleaned_content.append(part)
-                    msg["content"] = cleaned_content
-                elif isinstance(content, str):
-                    msg["content"] = re.sub(r"\[Image Attachment.*?: path [^\]]+\]", "", content)
-                cleaned_contexts.append(msg)
-            req.contexts = cleaned_contexts
-
-        req.image_urls = []
 
     def _sanitize_llm_request(self, req: ProviderRequest) -> None:
         req.prompt = self._sanitize_llm_value(req.prompt)
@@ -134,18 +105,20 @@ class OttoHubPlugin(Star):
 
     @filter.on_llm_request()
     async def apply_ottohub_llm_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
-        if event.__class__.__name__ == "OttoHubMessageEvent":
-            handlers = event.get_extra("activated_handlers") or []
-            handler_names = [
-                f"{getattr(h, 'handler_module_path', '')}:{getattr(h, 'handler_name', '')}"
-                for h in handlers
-                if "astrbot_plugin_ottohub" not in str(getattr(h, "handler_module_path", ""))
-            ]
-            logger.info(
-                "[OttoHub] LLM 阶段 text=%r activated_handlers=%s",
-                event.get_message_str(),
-                handler_names,
-            )
+        if event.__class__.__name__ != "OttoHubMessageEvent":
+            return
+
+        handlers = event.get_extra("activated_handlers") or []
+        handler_names = [
+            f"{getattr(h, 'handler_module_path', '')}:{getattr(h, 'handler_name', '')}"
+            for h in handlers
+            if "astrbot_plugin_ottohub" not in str(getattr(h, "handler_module_path", ""))
+        ]
+        logger.info(
+            "[OttoHub] LLM 阶段 text=%r activated_handlers=%s",
+            event.get_message_str(),
+            handler_names,
+        )
 
         user_prompt = event.get_extra("_ottohub_user_prompt")
         if isinstance(user_prompt, str) and user_prompt.strip():
@@ -155,22 +128,7 @@ class OttoHubPlugin(Star):
         if isinstance(context_prompt, str) and context_prompt.strip():
             self._append_system_prompt(req, context_prompt)
 
-        legacy_prompt = event.get_extra("_ottohub_llm_prompt")
-        if (
-            isinstance(legacy_prompt, str)
-            and legacy_prompt.strip()
-            and legacy_prompt.strip() != str(user_prompt or "").strip()
-            and legacy_prompt.strip() != str(context_prompt or "").strip()
-        ):
-            self._append_system_prompt(req, legacy_prompt)
-
-        if event.__class__.__name__ == "OttoHubMessageEvent":
-            self._append_system_prompt(req, self._config_text("system_prompt", ""))
-            self._append_system_prompt(req, self._config_text("reply_limit_prompt", DEFAULT_OTTOHUB_REPLY_LIMIT_PROMPT))
-            self._sanitize_llm_request(req)
-            use_external_ocr = self._config_text("use_external_ocr", "false").lower() in ("true", "1", "yes", "on")
-            if use_external_ocr:
-                self._clean_external_ocr_garbage(req)
+        self._sanitize_llm_request(req)
 
     # ------------------------------------------------------------------ system prompt helper
 

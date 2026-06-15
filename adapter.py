@@ -15,11 +15,59 @@ from astrbot.api.message_components import At, Image, Plain
 
 from .client import OttoHubClient
 from .event import OttoHubMessageEvent
+from .text_utils import dedupe as _dedupe_urls, extract_images as _extract_image_urls
 
 logger = logging.getLogger("astrbot")
 _SHARED_CONTEXT = None
 PLUGIN_CONFIG_PATH = Path("data/config/astrbot_plugin_ottohub_config.json")
 _PLACEHOLDER_IMAGE_PATH = Path(__file__).parent / "image_failed_placeholder.png"
+
+# 进程级配置缓存：按文件 mtime 失效，避免每条消息多次重复读盘解析
+_config_cache: dict[str, Any] = {}
+_config_cache_mtime: float = -1.0
+
+# WebUI 分组（与 _conf_schema.json 的 object 分组一一对应）。读盘后摊平回扁平键，
+# 使适配器内部所有按扁平键的读取无需改动，并兼容旧版扁平存储。
+CONFIG_GROUP_KEYS = ("reply_scope", "message_send", "post_context", "image_handling", "resend_audit")
+
+
+def flatten_plugin_config(data: dict[str, Any]) -> dict[str, Any]:
+    """把 WebUI 分组（嵌套 object）摊平为扁平键。兼容旧版已是扁平的存储。"""
+    flat: dict[str, Any] = {}
+    for key, value in data.items():
+        if key in CONFIG_GROUP_KEYS and isinstance(value, dict):
+            flat.update(value)
+        else:
+            flat[key] = value
+    return flat
+
+
+def load_plugin_config() -> dict[str, Any]:
+    global _config_cache, _config_cache_mtime
+    try:
+        if not PLUGIN_CONFIG_PATH.exists():
+            _config_cache, _config_cache_mtime = {}, -1.0
+            return {}
+        mtime = PLUGIN_CONFIG_PATH.stat().st_mtime
+        if mtime == _config_cache_mtime and _config_cache:
+            return _config_cache
+        with PLUGIN_CONFIG_PATH.open(encoding="utf-8-sig") as file_obj:
+            data = json.load(file_obj)
+        if not isinstance(data, dict):
+            _config_cache, _config_cache_mtime = {}, mtime
+            return {}
+
+        data = flatten_plugin_config(data)
+        
+        # 内存层面强制联动
+        if not data.get("reply_with_at", False):
+            data["use_effective_at"] = False
+            
+        _config_cache, _config_cache_mtime = data, mtime
+        return data
+    except Exception as exc:
+        logger.warning("[OttoHub] 加载插件配置失败，使用上次缓存: %s", exc)
+        return _config_cache or {}
 
 
 @dataclass
@@ -93,6 +141,8 @@ class OttoHubPlatformAdapter(Platform):
         self.context = _SHARED_CONTEXT
         self.client: OttoHubClient | None = None
         self.processed_ids: set[str] = set()
+        self.raw_messages_cache: dict[str, dict[str, Any]] = {}
+        self._re_response_tasks: set[asyncio.Task] = set()
         self.processed_comment_keys: dict[str, float] = {}
         self.sent_post_context_keys: dict[str, float] = {}
         self.post_context_dedupe_path = Path("data/config/astrbot_plugin_ottohub_post_context_dedupe.json")
@@ -119,12 +169,7 @@ class OttoHubPlatformAdapter(Platform):
         return bool(value)
 
     def _load_plugin_config(self) -> dict[str, Any]:
-        try:
-            with PLUGIN_CONFIG_PATH.open(encoding="utf-8-sig") as file_obj:
-                data = json.load(file_obj)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        return load_plugin_config()
 
     def _config_value(self, key: str, default: Any, plugin_config: dict[str, Any] | None = None) -> Any:
         if plugin_config is None:
@@ -165,17 +210,11 @@ class OttoHubPlatformAdapter(Platform):
 
     @staticmethod
     def _extract_images(text: str) -> list[str]:
-        return re.findall(r"https?://[^\s\"'<>]+\.(?:jpg|jpeg|png|gif|webp|bmp|svg)", text or "", re.I)
+        return _extract_image_urls(text)
 
     @staticmethod
     def _dedupe(values: list[str]) -> list[str]:
-        seen = set()
-        result = []
-        for value in values:
-            if value and value not in seen:
-                seen.add(value)
-                result.append(value)
-        return result
+        return _dedupe_urls(values)
 
     @staticmethod
     def _normalize_mentions(text: str) -> str:
@@ -335,11 +374,19 @@ class OttoHubPlatformAdapter(Platform):
         return await self.client.get_video_comments(post_id, num=num, parent_vcid=parent_id, offset=offset)
 
     async def _iter_recent_root_comments(self, kind: str, post_id: int):
-        for offset in (0, 12):
-            rows = await self._get_comments(kind, post_id, 0, offset, 12)
+        plugin_config = self._load_plugin_config()
+        limit = self._as_int(self._config_value("comment_retrieval_limit", 24, plugin_config))
+        limit = max(12, min(limit, 120))
+        page_size = 12
+        
+        retrieved = 0
+        while retrieved < limit:
+            num_to_fetch = min(page_size, limit - retrieved)
+            rows = await self._get_comments(kind, post_id, 0, retrieved, num_to_fetch)
             for row in rows:
                 yield row
-            if len(rows) < 12:
+            retrieved += len(rows)
+            if len(rows) < num_to_fetch:
                 break
 
     async def _find_matching_child(self, n: ParsedNotification, root: dict[str, Any]) -> ResolvedComment | None:
@@ -347,13 +394,16 @@ class OttoHubPlatformAdapter(Platform):
         if not root_id:
             return None
         bot_uid = str(getattr(self.client, "uid", "") or "")
-        # Collect ALL matching children across pages and return the most recent one.
-        # Previously the first match was returned, which caused old comment IDs to be
-        # reused when the user sent a new comment in the same thread, triggering the
-        # duplicate-skip logic even though the new comment had never been processed.
+        plugin_config = self._load_plugin_config()
+        limit = self._as_int(self._config_value("comment_retrieval_limit", 24, plugin_config))
+        limit = max(6, min(limit, 120))
+        page_size = 6
+        
         best: ResolvedComment | None = None
-        for offset in (0, 6):
-            children = await self._get_comments(n.kind, n.pid, root_id, offset, 6)
+        retrieved = 0
+        while retrieved < limit:
+            num_to_fetch = min(page_size, limit - retrieved)
+            children = await self._get_comments(n.kind, n.pid, root_id, retrieved, num_to_fetch)
             for child in children:
                 child_id = self._comment_id(n.kind, child)
                 child_uid = self._comment_uid(child)
@@ -386,7 +436,8 @@ class OttoHubPlatformAdapter(Platform):
                             best = candidate
                     elif candidate.comment_id and best.comment_id and candidate.comment_id > best.comment_id:
                         best = candidate
-            if len(children) < 6:
+            retrieved += len(children)
+            if len(children) < num_to_fetch:
                 break
         return best
 
@@ -706,6 +757,30 @@ class OttoHubPlatformAdapter(Platform):
             logger.debug("[OttoHub] 占位图创建失败: %s", exc)
             return False
 
+    def trigger_re_response(self, msg_id: str) -> None:
+        if not msg_id:
+            return
+        msg = self.raw_messages_cache.get(str(msg_id))
+        if not msg:
+            logger.warning("[OttoHub] 重新响应失败：未找到对应的原始消息 %s", msg_id)
+            return
+        
+        max_attempts = getattr(self.client, "resend_max_attempts", 2)
+        count = msg.get("re_respond_count", 0)
+        if count >= max_attempts:
+            logger.error("[OttoHub] 消息 %s 重新响应次数已达上限(%d)，终止重新响应以防死循环", msg_id, max_attempts)
+            return
+        
+        msg["re_respond_count"] = count + 1
+        logger.warning(
+            "[OttoHub] 触发第 %d/%d 次重新响应：将重置消息 %s 的去重并重新投递",
+            count + 1, max_attempts, msg_id,
+        )
+        self.processed_ids.discard(str(msg_id))
+        task = asyncio.create_task(self._process_message(msg))
+        self._re_response_tasks.add(task)
+        task.add_done_callback(self._re_response_tasks.discard)
+
     # ------------------------------------------------------------------ message processing
 
     async def _process_message(self, msg: dict[str, Any]) -> None:
@@ -713,9 +788,16 @@ class OttoHubPlatformAdapter(Platform):
         mk = str(mid) if mid is not None else None
         if not mk or mk in self.processed_ids:
             if mk:
-                await self.client.mark_message_read(int(mid))
+                await self.client.mark_message_read(mid)
             return
         self.processed_ids.add(mk)
+        if mk:
+            now = time.time()
+            for k, m in list(self.raw_messages_cache.items()):
+                if "cached_time" in m and now - m["cached_time"] > 6 * 3600:
+                    self.raw_messages_cache.pop(k, None)
+            msg["cached_time"] = now
+            self.raw_messages_cache[mk] = msg
         rc = str(msg.get("content") or "")
         suid = str(msg.get("sender") or "0")
         logger.info("[OttoHub] 收到通知: %s", msg)
@@ -731,6 +813,54 @@ class OttoHubPlatformAdapter(Platform):
             vid_m = re.search(r"VID[:：](\d+)", rc) or re.search(r"\(VID:(\d+)\)", rc)
             bc_m = re.search(r"BCID[:：](\d+)", rc) or re.search(r"\(BCID:(\d+)\)", rc)
             vc_m = re.search(r"VCID[:：](\d+)", rc) or re.search(r"\(VCID:(\d+)\)", rc)
+
+            # Audit pass check
+            is_audit_pass = ("通过了你" in rc or "通过了您" in rc) and (bc_m or vc_m)
+            if is_audit_pass and self.client:
+                found_cid = bc_m.group(1) if bc_m else vc_m.group(1)
+                kind_to_delete = "blog" if bc_m else "video"
+                try:
+                    if kind_to_delete == "blog":
+                        await self.client.delete_blog_comment(int(found_cid))
+                    else:
+                        await self.client.delete_video_comment(int(found_cid))
+                    logger.info("[OttoHub] 审核通过，自动物理删除对应评论: %s %s", kind_to_delete, found_cid)
+                except Exception as e:
+                    logger.error("[OttoHub] 物理删除审核通过评论异常: %s %s, 错误: %s", kind_to_delete, found_cid, e)
+                await self.client.mark_message_read(mid)
+                return
+
+            # Audit reject check
+            is_audit_reject = "驳回" in rc and (bc_m or vc_m)
+            if is_audit_reject and self.client:
+                logger.info("[OttoHub] 审核驳回通知，忽略: %s", rc)
+                await self.client.mark_message_read(mid)
+                return
+
+            # Violation detection (risk management) -> delete if monitored
+            is_violation = any(w in rc for w in ("审核", "违规", "待审核", "敏感", "隐藏", "下架", "删除", "屏蔽"))
+            if is_violation and self.client and self.client.resend_delete_on_audit:
+                found_cid = bc_m.group(1) if bc_m else (vc_m.group(1) if vc_m else None)
+                kind_to_delete = "blog" if bc_m else ("video" if vc_m else None)
+                if found_cid and kind_to_delete:
+                    monitored = self.client._monitored_comments.get(str(found_cid))
+                    if monitored:
+                        logger.warning("[OttoHub] 触发审核风险防范！检测到关于评论 %s 的审核通知，执行物理删除！", found_cid)
+                        try:
+                            if kind_to_delete == "blog":
+                                ok = await self.client.delete_blog_comment(int(found_cid))
+                            else:
+                                ok = await self.client.delete_video_comment(int(found_cid))
+                            if ok:
+                                logger.info("[OttoHub] 审核风险评论 %s 物理删除成功", found_cid)
+                            else:
+                                logger.warning("[OttoHub] 审核风险评论 %s 物理删除失败", found_cid)
+                            self.client._monitored_comments.pop(str(found_cid), None)
+                        except Exception as e:
+                            logger.error("[OttoHub] 物理删除审核风险评论 %s 异常: %s", found_cid, e)
+                        await self.client.mark_message_read(mid)
+                        return
+
             if bid_m:
                 kind = "blog"
                 pid = int(bid_m.group(1))
@@ -748,13 +878,21 @@ class OttoHubPlatformAdapter(Platform):
         parsed = ParsedNotification(kind, tt, ruid, sn, rc, pid, tid)
         plugin_config = self._load_plugin_config()
 
+        is_real_system_msg = suid == "0" and "回复了你" not in rc and "@了你" not in rc
+        if is_real_system_msg:
+            # 如果平台系统通知回复未开启，则在处理完审核删除等逻辑后，直接静默消费（标记已读并返回）
+            reply_sys = self._as_bool(self._config_value("reply_to_system_notifications", False, plugin_config), False)
+            if not reply_sys:
+                logger.info("[OttoHub] 平台系统通知不回复，静默消费: %s", rc)
+                await self.client.mark_message_read(mid)
+                return
+
         if not self._is_enabled_for(kind, plugin_config):
-            await self.client.mark_message_read(int(mid))
+            await self.client.mark_message_read(mid)
             return
         if str(ruid) == str(getattr(self.client, "uid", "")):
-            await self.client.mark_message_read(int(mid))
+            await self.client.mark_message_read(mid)
             return
-
         resolved = await self._resolve_comment(parsed)
         if self._seen_comment_key(kind, pid, resolved.comment_id):
             logger.info("[OttoHub] 跳过重复 %s/%s comment=%s", kind, pid, resolved.comment_id)
@@ -826,6 +964,7 @@ class OttoHubPlatformAdapter(Platform):
                 placeholder = f"[图片 {num}]" if url in all_images else f"[图片 {num} (图片加载失败)]"
                 resolved.text = resolved.text.replace(url, placeholder)
                 resolved.text = re.sub(r"!\[[^\]]*\]\(" + re.escape(url) + r"\)", placeholder, resolved.text)
+            logger.debug("[OttoHub] OCR 模式：已将用户评论中 %d 张图片替换为编号占位符", len(raw_image_urls))
 
         dispatch_text = self._command_text_for_dispatch(resolved.text)
         event_text = dispatch_text or resolved.text.strip() or "[仅 @ 机器人或空内容]"
@@ -838,7 +977,11 @@ class OttoHubPlatformAdapter(Platform):
         logo_fallback = str(Path(__file__).parent / "logo.png")
         for url in all_image_urls:
             if url in all_images:
+                # OCR 模式下仍附加有效图片组件，让多模态 LLM 直接读图
                 components.append(Image.fromURL(url))
+            elif use_external_ocr:
+                # OCR 模式：无效图片已在文本中以占位符说明，跳过附加占位图片组件
+                pass
             elif has_placeholder:
                 components.append(Image.fromFileSystem(_PLACEHOLDER_IMAGE_PATH))
             elif os.path.exists(logo_fallback):
@@ -871,9 +1014,8 @@ class OttoHubPlatformAdapter(Platform):
             kind + "_comment" if kind != "dm" else "dm",
             pid,
             resolved.reply_parent_id,
-            int(ruid),
+            self._as_int(ruid),
         )
-        use_external_ocr = self._as_bool(self._config_value("use_external_ocr", False, plugin_config), False)
         structured_prompt = self._build_structured_user_prompt(
             parsed, resolved, relation, post, msg,
             include_post_context=include_post_context,
@@ -882,7 +1024,6 @@ class OttoHubPlatformAdapter(Platform):
         )
         event.set_extra("_ottohub_user_prompt", structured_prompt)
         event.set_extra("_ottohub_context_prompt", self._build_system_context_prompt())
-        event.set_extra("_ottohub_llm_prompt", structured_prompt)
         event.set_extra("_ottohub_reply_parent_id", resolved.reply_parent_id)
         event.set_extra("_ottohub_comment_id", resolved.comment_id)
         event.set_extra("_ottohub_relation", relation)
@@ -913,10 +1054,14 @@ class OttoHubPlatformAdapter(Platform):
             image_upload_check_delay=self._config_value("image_upload_check_delay_seconds", 5, plugin_config),
             image_upload_retry_delay=self._config_value("image_upload_retry_delay_seconds", 5, plugin_config),
             resend_failed_messages=self._config_value("resend_failed_messages", False, plugin_config),
-            resend_attempts=self._config_value("resend_attempts", 3, plugin_config),
+            resend_re_respond=self._config_value("resend_re_respond", False, plugin_config),
+            resend_delete_on_audit=self._config_value("resend_delete_on_audit", False, plugin_config),
+            resend_max_attempts=self._config_value("resend_max_attempts", 2, plugin_config),
             resend_delay_seconds=self._config_value("resend_delay_seconds", 15, plugin_config),
-            resend_dedupe_ttl_seconds=self._config_value("resend_dedupe_ttl_seconds", 3600, plugin_config),
+            comment_retrieval_limit=self._config_value("comment_retrieval_limit", 24, plugin_config),
         )
+        # 反向绑定：补发 worker 触发重新响应时需要回调适配器
+        self.client.adapter = self
         if await self.client.verify_session():
             logger.info("[OttoHub] 已登录 uid=%s", self.client.uid)
         else:

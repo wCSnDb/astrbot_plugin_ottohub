@@ -1,74 +1,176 @@
 {
-  "reply_in_dm": {
-    "type": "bool",
-    "description": "私信回复",
-    "default": true,
-    "hint": "是否回复私信消息"
+  "reply_scope": {
+    "description": "回复范围",
+    "type": "object",
+    "items": {
+      "reply_in_dm": {
+        "type": "bool",
+        "description": "私信回复",
+        "default": true,
+        "hint": "是否回复私信消息"
+      },
+      "reply_in_blog_comments": {
+        "type": "bool",
+        "description": "动态评论回复",
+        "default": true,
+        "hint": "是否回复博客评论"
+      },
+      "reply_in_video_comments": {
+        "type": "bool",
+        "description": "视频评论回复",
+        "default": true,
+        "hint": "是否回复视频评论"
+      },
+      "reply_to_system_notifications": {
+        "type": "bool",
+        "description": "回复系统通知",
+        "default": false,
+        "hint": "是否对系统通知进行回复（如审核通知等）"
+      }
+    }
   },
-  "reply_in_blog_comments": {
-    "type": "bool",
-    "description": "博客评论回复",
-    "default": true,
-    "hint": "是否回复博客评论"
+  "message_send": {
+    "description": "消息发送",
+    "type": "object",
+    "items": {
+      "auto_split_segments": {
+        "type": "bool",
+        "description": "自动分段",
+        "default": true,
+        "hint": "开启后长回复会按句子边界拆成多条依次发送，关闭后超出上限的部分将被直接截断"
+      },
+      "message_max_length": {
+        "type": "int",
+        "description": "单条字数上限",
+        "default": 350,
+        "hint": "单条消息/评论的字符上限"
+      },
+      "reply_with_at": {
+        "type": "bool",
+        "description": "回复时@用户",
+        "default": false,
+        "hint": "在评论回复时，是否自动在消息开头加上“@用户”的前缀，但是不会收到被@的系统通知"
+      },
+      "use_effective_at": {
+        "type": "bool",
+        "description": "使用有效@通知",
+        "default": true,
+        "hint": "开启后用户可以收到被@的系统通知"
+      }
+    }
   },
-  "reply_in_video_comments": {
-    "type": "bool",
-    "description": "视频评论回复",
-    "default": true,
-    "hint": "是否回复视频评论"
+  "post_context": {
+    "description": "帖子上下文",
+    "type": "object",
+    "items": {
+      "include_post_comment_count": {
+        "type": "bool",
+        "description": "包含帖子评论数",
+        "default": true,
+        "hint": "上下文是否包含帖子评论数"
+      },
+      "include_post_like_count": {
+        "type": "bool",
+        "description": "包含帖子点赞数",
+        "default": true,
+        "hint": "上下文是否包含帖子点赞数"
+      },
+      "include_post_cold_count": {
+        "type": "bool",
+        "description": "包含帖子冷启动数",
+        "default": true,
+        "hint": "上下文是否包含帖子冷启动数"
+      },
+      "include_post_view_count": {
+        "type": "bool",
+        "description": "包含帖子阅读数",
+        "default": true,
+        "hint": "上下文是否包含帖子阅读数"
+      },
+      "dedupe_post_context": {
+        "type": "bool",
+        "description": "同会话帖子上下文去重",
+        "default": true,
+        "hint": "同一帖子上下文的去重处理"
+      },
+      "comment_retrieval_limit": {
+        "type": "int",
+        "description": "评论检索条数上限",
+        "default": 24,
+        "hint": "最多检索多少条评论作为上下文输入模型，上限过高可能会降低速度，如评论数量超过检索上限，可能会回复失败"
+      }
+    }
   },
-  "include_post_comment_count": {
-    "type": "bool",
-    "description": "包含帖子评论数",
-    "default": true,
-    "hint": "上下文是否包含帖子评论数"
+  "image_handling": {
+    "description": "图片处理",
+    "type": "object",
+    "items": {
+      "image_upload_validate": {
+        "type": "bool",
+        "description": "校验图片上传结果",
+        "default": true,
+        "hint": "是否自动校验图片上传状态"
+      },
+      "image_upload_attempts": {
+        "type": "int",
+        "description": "图片上传尝试次数",
+        "default": 3,
+        "hint": "上传失败重试最大次数"
+      },
+      "image_upload_check_delay_seconds": {
+        "type": "int",
+        "description": "上传后校验等待秒数",
+        "default": 5,
+        "hint": "上传后等待多少秒再校验状态"
+      },
+      "image_upload_retry_delay_seconds": {
+        "type": "int",
+        "description": "失败后重试等待秒数",
+        "default": 5,
+        "hint": "重试上传前等待多少秒"
+      },
+      "use_external_ocr": {
+        "type": "bool",
+        "description": "图片 OCR 模式",
+        "default": false,
+        "hint": "开启后，用户评论中的图片 URL 会替换为[图片 N]编号占位符，用来减少模型幻觉"
+      }
+    }
   },
-  "include_post_like_count": {
-    "type": "bool",
-    "description": "包含帖子点赞数",
-    "default": true,
-    "hint": "上下文是否包含帖子点赞数"
-  },
-  "include_post_cold_count": {
-    "type": "bool",
-    "description": "包含帖子冷启动数",
-    "default": true,
-    "hint": "上下文是否包含帖子冷启动数"
-  },
-  "include_post_view_count": {
-    "type": "bool",
-    "description": "包含帖子阅读数",
-    "default": true,
-    "hint": "上下文是否包含帖子阅读数"
-  },
-  "image_upload_validate": {
-    "type": "bool",
-    "description": "校验图片上传结果",
-    "default": true,
-    "hint": "是否自动校验图片上传状态"
-  },
-  "image_upload_attempts": {
-    "type": "int",
-    "description": "图片上传尝试次数",
-    "default": 3,
-    "hint": "上传失败重试最大次数"
-  },
-  "image_upload_check_delay_seconds": {
-    "type": "int",
-    "description": "上传后校验等待秒数",
-    "default": 5,
-    "hint": "上传后等待多少秒再校验状态"
-  },
-  "image_upload_retry_delay_seconds": {
-    "type": "int",
-    "description": "失败后重试等待秒数",
-    "default": 5,
-    "hint": "重试上传前等待多少秒"
-  },
-  "dedupe_post_context": {
-    "type": "bool",
-    "description": "同会话帖子上下文去重",
-    "default": true,
-    "hint": "同一帖子上下文的去重处理"
+  "resend_audit": {
+    "description": "补发设置",
+    "type": "object",
+    "items": {
+      "resend_failed_messages": {
+        "type": "bool",
+        "description": "发送失败自动补发",
+        "default": true,
+        "hint": "消息发送失败时，自动加入后台补发队列重试"
+      },
+      "resend_delay_seconds": {
+        "type": "int",
+        "description": "补发延迟秒数",
+        "default": 15,
+        "hint": "补发失败后的重试等待秒数"
+      },
+      "resend_re_respond": {
+        "type": "bool",
+        "description": "重新触发响应",
+        "default": false,
+        "hint": "补发重试失败或前台找不到评论时，直接让模型进行一次重新响应，生成新的回复内容并发送，而不是原样重试发送之前的回复内容"
+      },
+      "resend_max_attempts": {
+        "type": "int",
+        "description": "重试最大次数",
+        "default": 2,
+        "hint": "重新触发大模型流程的次数或者原样重新发送的次数"
+      },
+      "resend_delete_on_audit": {
+        "type": "bool",
+        "description": "拦截自动物理删除",
+        "default": false,
+        "hint": "当收到系统审核/违规通知且在需要被删除范围内，自动物理删除对应发出的评论"
+      }
+    }
   }
 }
