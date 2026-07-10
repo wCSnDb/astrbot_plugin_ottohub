@@ -6,7 +6,7 @@ from astrbot.api.star import Context, Star, register
 from .text_utils import sanitize_text, strip_data_images
 
 
-@register("Ottohub Adapter", "wcsndb", "OttoHub 适配器", "0.1.1")
+@register("Ottohub Adapter", "wcsndb", "OttoHub 适配器", "0.1.6")
 class OttoHubPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)

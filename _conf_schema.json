@@ -56,6 +56,12 @@
         "description": "使用有效@通知",
         "default": true,
         "hint": "开启后用户可以收到被@的系统通知"
+      },
+      "min_write_interval_seconds": {
+        "type": "int",
+        "description": "最短发送间隔(秒)",
+        "default": 3,
+        "hint": "两次评论/私信发送之间的最短间隔。主回复和工具/插件的主动发送（如收款码、独立表情包）经常在很短时间内先后触发，间隔太短容易被 OttoHub 判定为 too_many_requests 而直接拒绝"
       }
     }
   },
@@ -63,6 +69,12 @@
     "description": "帖子上下文",
     "type": "object",
     "items": {
+      "unified_session_mode": {
+        "type": "bool",
+        "description": "单会话模式",
+        "default": false,
+        "hint": "开启后不再按私信/每个帖子分别维护会话，所有私信和评论都并入同一个会话，共享同一份对话上下文；仍然可以用 /reset 清除这个共享会话的上下文"
+      },
       "include_post_comment_count": {
         "type": "bool",
         "description": "包含帖子评论数",
@@ -170,6 +182,98 @@
         "description": "拦截自动物理删除",
         "default": false,
         "hint": "当收到系统审核/违规通知且在需要被删除范围内，自动物理删除对应发出的评论"
+      }
+    }
+  },
+  "third_party_image_host": {
+    "description": "第三方图床",
+    "type": "object",
+    "items": {
+      "use_third_party_image_host": {
+        "type": "bool",
+        "description": "使用第三方图床",
+        "default": false,
+        "hint": "开启后，第三方图床（按 R2 → StarDots → 蜜蜂图床 顺序，跳过未填齐凭据的）取代 OttoHub 自带图床成为主图床；关闭则完全不使用第三方图床，行为和原来一样"
+      },
+      "fallback_mode": {
+        "type": "bool",
+        "description": "兜底模式",
+        "default": true,
+        "hint": "仅在开启“使用第三方图床”时生效：第三方图床全部上传失败后，是否回退尝试 OttoHub 自带图床；关闭则第三方图床失败后直接放弃，不再回退"
+      },
+      "fallback_max_kb": {
+        "type": "int",
+        "description": "上传压缩目标(KB)",
+        "default": 800,
+        "hint": "上传到第三方图床前，若图片超过该大小会尝试压缩到目标大小以内（例如 StarDots 单图上限 3MB），体积越小上传越快也越不容易超限"
+      },
+      "cloudflare_r2": {
+        "description": "Cloudflare R2 配置",
+        "type": "object",
+        "items": {
+          "r2_account_id": {
+            "type": "string",
+            "description": "Account ID",
+            "hint": "Cloudflare R2 的 Account ID"
+          },
+          "r2_access_key_id": {
+            "type": "string",
+            "description": "Access Key ID",
+            "hint": "Cloudflare R2 的 Access Key ID"
+          },
+          "r2_secret_access_key": {
+            "type": "string",
+            "description": "Secret Access Key",
+            "hint": "Cloudflare R2 的 Secret Access Key"
+          },
+          "r2_bucket_name": {
+            "type": "string",
+            "description": "Bucket 名称",
+            "hint": "Cloudflare R2 的存储桶名称"
+          },
+          "r2_public_url": {
+            "type": "string",
+            "description": "自定义域名（可选）",
+            "hint": "自定义 CDN 域名，例如 https://cdn.yourdomain.com；留空则使用 R2.dev 默认公开地址"
+          }
+        }
+      },
+      "stardots": {
+        "description": "StarDots 配置",
+        "type": "object",
+        "items": {
+          "stardots_key": {
+            "type": "string",
+            "description": "API Key",
+            "hint": "StarDots (stardots.io) 的 API Key"
+          },
+          "stardots_secret": {
+            "type": "string",
+            "description": "API Secret",
+            "hint": "StarDots 的 API Secret"
+          },
+          "stardots_space": {
+            "type": "string",
+            "description": "空间名称",
+            "hint": "StarDots 的空间(Space)名称；单图上限 3MB，已配合上面的压缩目标自动处理"
+          }
+        }
+      },
+      "beeimg": {
+        "description": "蜜蜂图床配置",
+        "type": "object",
+        "items": {
+          "beeimg_token": {
+            "type": "string",
+            "description": "Token",
+            "hint": "蜜蜂图床(beeimg.cn)个人中心生成的 API Token（作为 Bearer Token 使用）"
+          },
+          "beeimg_strategy_id": {
+            "type": "string",
+            "description": "存储策略ID（可选）",
+            "hint": "如账号配置了多个存储策略可指定 strategy_id，留空使用默认策略"
+          }
+        }
       }
     }
   }

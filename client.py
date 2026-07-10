@@ -9,6 +9,7 @@ from typing import Any
 
 import aiohttp
 
+from . import image_hosts
 from .text_utils import truncate_chars
 
 logger = logging.getLogger("astrbot")
@@ -21,6 +22,11 @@ TRANSIENT_RETRY_BACKOFF = 1.5
 
 # OttoHub 单条消息/评论的平台字符硬上限（最后安全网，防止超限被服务端拒绝）
 OTTOHUB_PLATFORM_MAX_CHARS = 400
+
+# 两次写操作（评论/私信）之间的最小间隔的默认值：主回复和工具/插件的主动发送
+# （如收款码、独立表情包）经常在几十到几百毫秒内先后触发，紧挨着连续调用 OttoHub
+# 写接口会被服务端判定为 too_many_requests 而直接拒绝。可在插件配置里调整。
+DEFAULT_MIN_WRITE_INTERVAL_SECONDS = 3.0
 
 
 class OttoHubClient:
@@ -38,6 +44,20 @@ class OttoHubClient:
         resend_max_attempts: int = 2,
         resend_delay_seconds: float = 15.0,
         comment_retrieval_limit: int = 24,
+        use_third_party_image_host: bool = False,
+        fallback_mode: bool = True,
+        r2_account_id: str = "",
+        r2_access_key_id: str = "",
+        r2_secret_access_key: str = "",
+        r2_bucket_name: str = "",
+        r2_public_url: str = "",
+        stardots_key: str = "",
+        stardots_secret: str = "",
+        stardots_space: str = "",
+        beeimg_token: str = "",
+        beeimg_strategy_id: str = "",
+        fallback_max_kb: int = 800,
+        min_write_interval_seconds: float = DEFAULT_MIN_WRITE_INTERVAL_SECONDS,
     ):
         self.cookies = cookies
         self.user_agent = user_agent
@@ -57,8 +77,36 @@ class OttoHubClient:
         self.resend_delay_seconds = self._clamp_float(resend_delay_seconds, 15.0, 1.0, 300.0)
         self.comment_retrieval_limit = self._clamp_int(comment_retrieval_limit, 24, 12, 120)
         self.resend_dedupe_ttl_seconds = 3600.0
+        self.min_write_interval_seconds = self._clamp_float(
+            min_write_interval_seconds, DEFAULT_MIN_WRITE_INTERVAL_SECONDS, 0.0, 60.0
+        )
+        # “使用第三方图床”：开启后第三方图床取代 OttoHub 自带图床成为主图床。
+        # “兜底模式”：仅在上面开启时才有意义——第三方图床全部失败后，是否回退到
+        # OttoHub 自带图床再试一次。
+        self.use_third_party_image_host = bool(use_third_party_image_host)
+        self.fallback_mode = bool(fallback_mode)
+        self._fallback_hosts = image_hosts.build_fallback_hosts(
+            enabled=self.use_third_party_image_host,
+            r2_account_id=r2_account_id,
+            r2_access_key_id=r2_access_key_id,
+            r2_secret_access_key=r2_secret_access_key,
+            r2_bucket_name=r2_bucket_name,
+            r2_public_url=r2_public_url,
+            stardots_key=stardots_key,
+            stardots_secret=stardots_secret,
+            stardots_space=stardots_space,
+            beeimg_token=beeimg_token,
+            beeimg_strategy_id=beeimg_strategy_id,
+        )
+        self.fallback_max_bytes = self._clamp_int(fallback_max_kb, 800, 50, 3000) * 1024
+        # OttoHubClient 本身只在平台适配器启动/重载时构造一次；下面这个签名用来在
+        # 关键调用点重新读一遍磁盘上的部分设置（第三方图床、最短发送间隔等），这样
+        # 在 WebUI 里改这些值不需要重启整个 AstrBot 就能生效（和适配器里其它按
+        # _config_value 实时读取的设置行为保持一致），而不是被构造时传入的值永久锁死。
+        self._dynamic_config_signature: tuple | None = None
         self.session: aiohttp.ClientSession | None = None
         self._write_lock = asyncio.Lock()
+        self._last_write_ts: float = 0.0
         self._resend_keys: dict[str, float] = {}
         self._resend_tasks: set[asyncio.Task] = set()
         self._bg_tasks: set[asyncio.Task] = set()
@@ -232,6 +280,15 @@ class OttoHubClient:
             "GET", "https://api.ottohub.cn" + path, params=request_params, log_tag="OttoHub REST API"
         )
 
+    async def _throttle_write(self) -> None:
+        """确保与上一次写操作（评论/私信）至少间隔 self.min_write_interval_seconds，
+        避免紧挨着连续发起请求触发 OttoHub 的 too_many_requests 限流。"""
+        self._refresh_dynamic_config()
+        wait = self.min_write_interval_seconds - (time.time() - self._last_write_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_write_ts = time.time()
+
     @staticmethod
     def _write_ok(response: dict[str, Any], action: str) -> bool:
         status = str(response.get("status") or "").lower()
@@ -272,6 +329,7 @@ class OttoHubClient:
 
     async def send_message(self, receiver: int, content: str) -> bool:
         async with self._write_lock:
+            await self._throttle_write()
             response = await self._request(
                 "POST", {"module": "im", "action": "send_message", "receiver": receiver, "message": self._limit_chars(content)}
             )
@@ -279,6 +337,7 @@ class OttoHubClient:
 
     async def comment_blog(self, bid: int, content: str, parent_bcid: int = 0) -> bool:
         async with self._write_lock:
+            await self._throttle_write()
             logger.info("[OttoHub] 评论动态 bid=%s parent_bcid=%s", bid, parent_bcid)
             response = await self._request(
                 "POST",
@@ -310,6 +369,7 @@ class OttoHubClient:
 
     async def comment_video(self, vid: int, content: str, parent_vcid: int = 0) -> bool:
         async with self._write_lock:
+            await self._throttle_write()
             logger.info("[OttoHub] 评论视频 vid=%s parent_vcid=%s", vid, parent_vcid)
             response = await self._request(
                 "POST",
@@ -734,7 +794,130 @@ class OttoHubClient:
 
         return self._image_as_jpeg_payload(path)
 
+    def _shrink_for_fallback(self, data: bytes, filename: str, content_type: str) -> tuple[bytes, str, str]:
+        """兜底图床上传前的二次压缩：体积越小上传越快，也越不容易撞到第三方图床的
+        单图大小限制（例如 StarDots 单图上限 3MB）。GIF/SVG 保持原样，不做有损转码。"""
+        if content_type in ("image/gif", "image/svg+xml") or len(data) <= self.fallback_max_bytes:
+            return data, filename, content_type
+        try:
+            import io
+
+            from PIL import Image as PILImage
+
+            img = PILImage.open(io.BytesIO(data))
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            base_name = os.path.splitext(filename)[0] + ".jpg"
+
+            best = data
+            for quality in (70, 55, 40, 28, 18):
+                out = io.BytesIO()
+                img.save(out, format="JPEG", quality=quality, optimize=True)
+                best = out.getvalue()
+                if len(best) <= self.fallback_max_bytes:
+                    return best, base_name, "image/jpeg"
+
+            width, height = img.size
+            for scale in (0.75, 0.5, 0.35):
+                resized = img.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    PILImage.Resampling.LANCZOS,
+                )
+                out = io.BytesIO()
+                resized.save(out, format="JPEG", quality=40, optimize=True)
+                best = out.getvalue()
+                if len(best) <= self.fallback_max_bytes:
+                    return best, base_name, "image/jpeg"
+
+            logger.warning(
+                "[OttoHub] 兜底图床压缩后仍超过 %d KB，按压缩到最小的一次结果上传",
+                self.fallback_max_bytes // 1024,
+            )
+            return best, base_name, "image/jpeg"
+        except Exception as exc:
+            logger.warning("[OttoHub] 兜底图床压缩失败，改用原始数据: %s", exc)
+            return data, filename, content_type
+
+    async def _upload_via_fallback_hosts(self, upload_payload: tuple[bytes, str, str], file_hash: str) -> str | None:
+        data, filename, content_type = self._shrink_for_fallback(*upload_payload)
+        for host in self._fallback_hosts:
+            try:
+                url = await host.upload(data, filename, content_type)
+            except Exception as exc:
+                logger.warning("[OttoHub][%s] 兜底上传异常: %s", host.name, exc)
+                continue
+            if not url:
+                logger.warning("[OttoHub][%s] 兜底上传失败", host.name)
+                continue
+            logger.info("[OttoHub] 兜底图床 %s 上传成功: %s", host.name, url)
+            if file_hash:
+                cache = self._load_image_cache()
+                entry = cache.get(file_hash, {})
+                entry["oh"] = url
+                cache[file_hash] = entry
+                self._save_image_cache(cache)
+            return url
+        return None
+
+    def _refresh_dynamic_config(self) -> None:
+        """从磁盘重新读取第三方图床、最短发送间隔等设置，跳过没有变化的情况（避免
+        每次调用都重建 host 列表、刷日志）。适配器不存在或读取失败时保留上一次的
+        状态不动。"""
+        adapter = getattr(self, "adapter", None)
+        if not adapter or not hasattr(adapter, "_load_plugin_config"):
+            return
+        try:
+            pc = adapter._load_plugin_config()
+        except Exception:
+            return
+
+        signature = (
+            bool(pc.get("use_third_party_image_host", False)),
+            bool(pc.get("fallback_mode", True)),
+            pc.get("fallback_max_kb", 800),
+            pc.get("r2_account_id", ""),
+            pc.get("r2_access_key_id", ""),
+            pc.get("r2_secret_access_key", ""),
+            pc.get("r2_bucket_name", ""),
+            pc.get("r2_public_url", ""),
+            pc.get("stardots_key", ""),
+            pc.get("stardots_secret", ""),
+            pc.get("stardots_space", ""),
+            pc.get("beeimg_token", ""),
+            pc.get("beeimg_strategy_id", ""),
+            pc.get("min_write_interval_seconds", DEFAULT_MIN_WRITE_INTERVAL_SECONDS),
+        )
+        if signature == self._dynamic_config_signature:
+            return
+
+        self._dynamic_config_signature = signature
+        self.use_third_party_image_host = signature[0]
+        self.fallback_mode = signature[1]
+        self.fallback_max_bytes = self._clamp_int(signature[2], 800, 50, 3000) * 1024
+        self._fallback_hosts = image_hosts.build_fallback_hosts(
+            enabled=self.use_third_party_image_host,
+            r2_account_id=signature[3],
+            r2_access_key_id=signature[4],
+            r2_secret_access_key=signature[5],
+            r2_bucket_name=signature[6],
+            r2_public_url=signature[7],
+            stardots_key=signature[8],
+            stardots_secret=signature[9],
+            stardots_space=signature[10],
+            beeimg_token=signature[11],
+            beeimg_strategy_id=signature[12],
+        )
+        self.min_write_interval_seconds = self._clamp_float(
+            signature[13], DEFAULT_MIN_WRITE_INTERVAL_SECONDS, 0.0, 60.0
+        )
+        logger.info(
+            "[OttoHub] 动态配置已刷新: 使用第三方图床=%s 兜底模式=%s hosts=%s 最短发送间隔=%.1fs",
+            self.use_third_party_image_host, self.fallback_mode,
+            [h.name for h in self._fallback_hosts], self.min_write_interval_seconds,
+        )
+
     async def upload_image(self, file_path: str) -> str | None:
+        self._refresh_dynamic_config()
         path = str(file_path or "")
         if path.startswith("file://"):
             path = path[7:]
@@ -754,21 +937,39 @@ class OttoHubClient:
             logger.warning("[OttoHub] 图片上传预处理失败，已丢弃: %s", exc)
             return None
 
-        cache = {}
         if file_hash:
             cache = self._load_image_cache()
             cached_entry = cache.get(file_hash, {})
-            oh_url = cached_entry.get("oh")
-            if oh_url:
-                if not self.image_upload_validate or await self.validate_image_url(oh_url):
-                    logger.info("[OttoHub] 复用缓存图片 hash=%.10s url=%s", file_hash, oh_url)
-                    return oh_url
-                else:
-                    logger.warning("[OttoHub] 缓存图片已失效: %s", oh_url)
-                    cached_entry.pop("oh", None)
-                    cache[file_hash] = cached_entry
-                    self._save_image_cache(cache)
+            cached_url = cached_entry.get("oh")
+            if cached_url:
+                if not self.image_upload_validate or await self.validate_image_url(cached_url):
+                    logger.info("[OttoHub] 复用缓存图片 hash=%.10s url=%s", file_hash, cached_url)
+                    return cached_url
+                logger.warning("[OttoHub] 缓存图片已失效: %s", cached_url)
+                cached_entry.pop("oh", None)
+                cache[file_hash] = cached_entry
+                self._save_image_cache(cache)
 
+        # “使用第三方图床”开启时，第三方图床取代 OttoHub 自带图床成为主图床；
+        # “兜底模式”决定第三方图床全部失败后要不要回退到 OttoHub 自带图床。
+        if self.use_third_party_image_host:
+            if self._fallback_hosts:
+                url = await self._upload_via_fallback_hosts(upload_payload, file_hash)
+                if url:
+                    return url
+                logger.warning("[OttoHub] 第三方图床均上传失败: %s", path)
+                if not self.fallback_mode:
+                    logger.error("[OttoHub] 兜底模式已关闭，不再回退到 OttoHub 自带图床，本次放弃: %s", path)
+                    return None
+                logger.info("[OttoHub] 兜底模式已开启，回退尝试 OttoHub 自带图床")
+            else:
+                logger.warning("[OttoHub] 已开启“使用第三方图床”但未填写任何图床凭据，直接使用 OttoHub 自带图床")
+
+        return await self._upload_via_ottohub_own(upload_payload, file_hash, path)
+
+    async def _upload_via_ottohub_own(
+        self, upload_payload: tuple[bytes, str, str], file_hash: str, path: str
+    ) -> str | None:
         for attempt in range(1, self.image_upload_attempts + 1):
             url = await self._upload_image_once(upload_payload)
             if not url:

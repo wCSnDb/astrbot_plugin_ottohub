@@ -1,6 +1,6 @@
 name: astrbot_plugin_ottohub
 display_name: Ottohub Adapter
 desc: OttoHub 平台适配器插件，支持对接 OttoHub 机器人平台。
-version: 0.1.5r
+version: 0.1.6
 author: wcsndb
 repo: https://github.com/wcsndb/astrbot_plugin_ottohub

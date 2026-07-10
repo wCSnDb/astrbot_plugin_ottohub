@@ -1,0 +1,4 @@
+aiohttp
+pillow
+boto3
+botocore

@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from astrbot.api.event import MessageChain
 from astrbot.api.platform import AstrBotMessage, Platform, PlatformMetadata, register_platform_adapter
 from astrbot.core.platform import MessageType
 from astrbot.core.platform.astrbot_message import Group, MessageMember
+from astrbot.core.platform.message_session import MessageSesion
 from astrbot.api.message_components import At, Image, Plain
 
 from .client import OttoHubClient
@@ -26,17 +28,18 @@ _PLACEHOLDER_IMAGE_PATH = Path(__file__).parent / "image_failed_placeholder.png"
 _config_cache: dict[str, Any] = {}
 _config_cache_mtime: float = -1.0
 
-# WebUI 分组（与 _conf_schema.json 的 object 分组一一对应）。读盘后摊平回扁平键，
-# 使适配器内部所有按扁平键的读取无需改动，并兼容旧版扁平存储。
-CONFIG_GROUP_KEYS = ("reply_scope", "message_send", "post_context", "image_handling", "resend_audit")
-
 
 def flatten_plugin_config(data: dict[str, Any]) -> dict[str, Any]:
-    """把 WebUI 分组（嵌套 object）摊平为扁平键。兼容旧版已是扁平的存储。"""
+    """把 WebUI 分组（可能多层嵌套的 object，如“第三方图床”下面又分 R2/StarDots/
+    蜜蜂图床几个子分组）递归摊平为扁平键。兼容旧版已是扁平的存储。
+
+    本插件的 schema 里没有任何配置项的值本身就应该是字典，所以这里对任意字典值
+    都直接展开，不需要再维护一份分组名单。
+    """
     flat: dict[str, Any] = {}
     for key, value in data.items():
-        if key in CONFIG_GROUP_KEYS and isinstance(value, dict):
-            flat.update(value)
+        if isinstance(value, dict):
+            flat.update(flatten_plugin_config(value))
         else:
             flat[key] = value
     return flat
@@ -145,6 +148,17 @@ class OttoHubPlatformAdapter(Platform):
         self._re_response_tasks: set[asyncio.Task] = set()
         self.processed_comment_keys: dict[str, float] = {}
         self.sent_post_context_keys: dict[str, float] = {}
+        # session_id -> (kind, target_id, parent_id)。context.send_message 只带有
+        # session_id，不携带具体要回复哪个帖子/哪条评论；主动发送（收款码工具、
+        # meme_manager 独立表情等）需要靠这张表把消息路由到正确的目标 —— 尤其是
+        # 开启"单会话模式"后 session_id 会变成一个固定常量，不再能从字符串本身
+        # 解析出 kind/target，必须靠这张表记录"最近一次是谁/哪个帖子在说话"。
+        self.session_routes: dict[str, tuple[str, int, int]] = {}
+        # session_id -> 该会话里最近一次讨论的帖子 id。仅在"单会话模式"下才有意义：
+        # 正常模式每个帖子本来就有自己独立的 session，不存在"和上一条是不是同一个
+        # 帖子"这个问题；单会话模式下大家共用一个 session，需要靠这个来判断当前这
+        # 条评论是不是切换到了一个新帖子，从而在 prompt 里标注"新帖子"提醒模型。
+        self.session_last_post: dict[str, int] = {}
         self.post_context_dedupe_path = Path("data/config/astrbot_plugin_ottohub_post_context_dedupe.json")
         self._load_post_context_dedupe()
         logger.info("[OttoHub] 初始化完成")
@@ -621,14 +635,22 @@ class OttoHubPlatformAdapter(Platform):
         include_post_context: bool = True,
         use_external_ocr: bool = False,
         plugin_config: dict[str, Any] | None = None,
+        is_new_post: bool = False,
     ) -> str:
         comment_text = resolved.text.strip() or "[仅 @ 机器人或空内容]"
         comment_time = resolved.comment_time or str(raw_msg.get("time") or "")
         if not comment_time:
             comment_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        new_post_notice = (
+            "【新帖子】以下评论所在的帖子和会话前文讨论的不是同一个帖子，请勿把两者内容混淆。"
+            if is_new_post
+            else ""
+        )
 
         if not include_post_context and n.kind != "dm":
             lines = [f"有人@了你：{n.sn}(UID:{n.suid})：{comment_text}"]
+            if new_post_notice:
+                lines.append(new_post_notice)
             if resolved.is_child:
                 parent_desc = "机器人评论" if str(resolved.parent_uid) == str(getattr(self.client, "uid", "")) else "父评论"
                 lines.append(f"类型：回复{parent_desc}")
@@ -652,6 +674,8 @@ class OttoHubPlatformAdapter(Platform):
         if resolved.is_child:
             parent_desc = "机器人评论" if str(resolved.parent_uid) == str(getattr(self.client, "uid", "")) else "父评论"
             lines.append(f"线程关系：本次评论是{parent_desc}下的回复；第一行是本次新评论，父评论只作上下文。")
+        if new_post_notice:
+            lines.append(new_post_notice)
         if n.kind != "dm":
             title = str(post.get("title") or "").strip()
             section_name = "动态内容" if n.kind == "blog" else "视频内容"
@@ -913,11 +937,28 @@ class OttoHubPlatformAdapter(Platform):
             await self.client.mark_message_read(int(mid))
             return
 
-        sid = f"dm-{ruid}" if kind == "dm" else f"{kind}-{pid or ruid}"
+        unified_session_mode = self._as_bool(self._config_value("unified_session_mode", False, plugin_config), False)
+        if unified_session_mode:
+            sid = "unified-session"
+            is_dm_message_type = False  # 单会话模式下 DM/评论统一按同一种消息类型处理，确保共享同一个会话
+        else:
+            sid = f"dm-{ruid}" if kind == "dm" else f"{kind}-{pid or ruid}"
+            is_dm_message_type = kind == "dm"
+        self.session_routes[sid] = (
+            kind,
+            self._as_int(ruid) if kind == "dm" else pid,
+            0 if kind == "dm" else resolved.reply_parent_id,
+        )
+
+        is_new_post = False
+        if unified_session_mode and kind != "dm" and pid:
+            last_pid = self.session_last_post.get(sid)
+            is_new_post = last_pid is not None and last_pid != pid
+            self.session_last_post[sid] = pid
 
         # 检查会话历史（仅用于诊断，不影响去重逻辑）
         history_is_empty = True
-        umo = f"ottohub:{'GroupMessage' if kind != 'dm' else 'FriendMessage'}:{sid}"
+        umo = f"ottohub:{'FriendMessage' if is_dm_message_type else 'GroupMessage'}:{sid}"
         try:
             if self.context and hasattr(self.context, "conversation_manager"):
                 cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
@@ -995,7 +1036,7 @@ class OttoHubPlatformAdapter(Platform):
         mo.self_id = str(self.client.uid or "")
         mo.session_id = sid
         mo.message_id = mk
-        mo.type = MessageType.GROUP_MESSAGE if kind != "dm" else MessageType.FRIEND_MESSAGE
+        mo.type = MessageType.FRIEND_MESSAGE if is_dm_message_type else MessageType.GROUP_MESSAGE
         mo.group_id = str(pid) if kind != "dm" else ""
         mo.sender = MessageMember(user_id=ruid, nickname=sn)
         if kind != "dm":
@@ -1021,6 +1062,7 @@ class OttoHubPlatformAdapter(Platform):
             include_post_context=include_post_context,
             use_external_ocr=use_external_ocr,
             plugin_config=plugin_config,
+            is_new_post=is_new_post,
         )
         event.set_extra("_ottohub_user_prompt", structured_prompt)
         event.set_extra("_ottohub_context_prompt", self._build_system_context_prompt())
@@ -1059,6 +1101,20 @@ class OttoHubPlatformAdapter(Platform):
             resend_max_attempts=self._config_value("resend_max_attempts", 2, plugin_config),
             resend_delay_seconds=self._config_value("resend_delay_seconds", 15, plugin_config),
             comment_retrieval_limit=self._config_value("comment_retrieval_limit", 24, plugin_config),
+            use_third_party_image_host=self._config_value("use_third_party_image_host", False, plugin_config),
+            fallback_mode=self._config_value("fallback_mode", True, plugin_config),
+            r2_account_id=self._config_value("r2_account_id", "", plugin_config),
+            r2_access_key_id=self._config_value("r2_access_key_id", "", plugin_config),
+            r2_secret_access_key=self._config_value("r2_secret_access_key", "", plugin_config),
+            r2_bucket_name=self._config_value("r2_bucket_name", "", plugin_config),
+            r2_public_url=self._config_value("r2_public_url", "", plugin_config),
+            stardots_key=self._config_value("stardots_key", "", plugin_config),
+            stardots_secret=self._config_value("stardots_secret", "", plugin_config),
+            stardots_space=self._config_value("stardots_space", "", plugin_config),
+            beeimg_token=self._config_value("beeimg_token", "", plugin_config),
+            beeimg_strategy_id=self._config_value("beeimg_strategy_id", "", plugin_config),
+            fallback_max_kb=self._config_value("fallback_max_kb", 800, plugin_config),
+            min_write_interval_seconds=self._config_value("min_write_interval_seconds", 3, plugin_config),
         )
         # 反向绑定：补发 worker 触发重新响应时需要回调适配器
         self.client.adapter = self
@@ -1076,4 +1132,110 @@ class OttoHubPlatformAdapter(Platform):
             await asyncio.sleep(5)
 
     def meta(self) -> PlatformMetadata:
-        return PlatformMetadata(id="ottohub", name="OttoHub", description="OttoHub Adapter", logo_path="logo.png")
+        # 本适配器没有实现真正的 send_streaming（评论区场景没有逐字编辑消息的能力），
+        # 必须如实声明不支持流式，否则一旦全局开启"流式回复"，核心会误以为本平台能
+        # 处理流式结果而不做兜底降级，走到 event.send_streaming 时命中基类的空实现，
+        # 导致回复完全发不出去。
+        return PlatformMetadata(
+            id="ottohub", name="OttoHub", description="OttoHub Adapter", logo_path="logo.png",
+            support_streaming_message=False,
+        )
+
+    # ------------------------------------------------------------------ proactive send (context.send_message)
+
+    async def _proactive_image_source(self, comp: Any) -> str | None:
+        """把消息链里的图片组件转换成 client.upload_image 能处理的本地路径/URL。"""
+        target = str(getattr(comp, "path", None) or getattr(comp, "file", None) or getattr(comp, "url", None) or "")
+        if not target:
+            return None
+        if target.startswith("base64://"):
+            try:
+                return await comp.convert_to_file_path()
+            except Exception as exc:
+                logger.error("[OttoHub] 主动发送图片(base64)解析失败: %s", exc)
+                return None
+        return target
+
+    async def send_by_session(self, session: MessageSesion, message_chain: MessageChain) -> None:
+        """支持插件通过 context.send_message(unified_msg_origin, ...) 主动推送消息。
+
+        基类默认实现是空操作（仅上报指标），OttoHub 此前未覆盖它，导致任何依赖
+        主动发送（而非通过 event.send 回复）的插件（如收款码工具）在本平台上
+        看似发送成功，实际什么都没有发出去。
+        """
+        if not self.client:
+            logger.warning("[OttoHub] 客户端尚未就绪，主动发送消息已丢弃 session_id=%s", getattr(session, "session_id", ""))
+            return await super().send_by_session(session, message_chain)
+
+        sid = str(getattr(session, "session_id", "") or "")
+        route = self.session_routes.get(sid)
+        if route:
+            # 优先查这张按 session_id 记录的路由表——开启"单会话模式"后 session_id
+            # 是个固定常量，没法再从字符串本身解析出 kind/target，必须靠它。
+            kind, target_id, reply_parent_id = route
+        elif sid.startswith("dm-"):
+            kind, target_id, reply_parent_id = "dm", self._as_int(sid[len("dm-"):]), 0
+        elif sid.startswith("blog-"):
+            kind, target_id, reply_parent_id = "blog", self._as_int(sid[len("blog-"):]), 0
+        elif sid.startswith("video-"):
+            kind, target_id, reply_parent_id = "video", self._as_int(sid[len("video-"):]), 0
+        else:
+            kind, target_id, reply_parent_id = "dm", self._as_int(sid), 0
+
+        comp_list = message_chain.chain if hasattr(message_chain, "chain") else message_chain
+        if not isinstance(comp_list, (list, tuple)):
+            comp_list = [comp_list]
+
+        text_parts: list[str] = []
+        image_urls: list[str] = []
+        for comp in comp_list:
+            if isinstance(comp, Image) or comp.__class__.__name__ == "Image":
+                source = await self._proactive_image_source(comp)
+                if source:
+                    img_url = await self.client.upload_image(source)
+                    if img_url:
+                        image_urls.append(img_url)
+            elif isinstance(comp, At):
+                text_parts.append(f"@{getattr(comp, 'qq', '')} ")
+            elif isinstance(comp, Plain) or hasattr(comp, "text"):
+                text_parts.append(str(getattr(comp, "text", "")))
+
+        content = "".join(text_parts).strip()
+        for url in image_urls:
+            content = (content + f"\n![image]({url})").strip()
+
+        if not content:
+            logger.warning("[OttoHub] 主动发送消息内容为空，已丢弃 session_id=%s", sid)
+            return await super().send_by_session(session, message_chain)
+
+        if kind not in ("dm", "blog", "video") or not target_id:
+            logger.warning("[OttoHub] 无法解析主动发送目标 session_id=%s", sid)
+            return await super().send_by_session(session, message_chain)
+
+        # 主动发送经常和主回复几乎同时触发（比如 LLM 一边回复一边调用工具），
+        # 紧挨着连续调用写接口容易被 OttoHub 判定为 too_many_requests。这里做
+        # 有限次重试（client 内部也有全局最小写间隔兜底），而不是一次失败就丢弃。
+        ok = False
+        attempts = 2
+        for attempt in range(1, attempts + 1):
+            try:
+                if kind == "dm":
+                    ok = await self.client.send_message(target_id, content)
+                elif kind == "blog":
+                    ok = await self.client.comment_blog(target_id, content, reply_parent_id)
+                else:
+                    ok = await self.client.comment_video(target_id, content, reply_parent_id)
+            except Exception as exc:
+                logger.error("[OttoHub] 主动发送消息异常(第 %d/%d 次) session_id=%s: %s", attempt, attempts, sid, exc, exc_info=True)
+                ok = False
+            if ok or attempt == attempts:
+                break
+            logger.warning("[OttoHub] 主动发送消息失败，5s 后重试(第 %d/%d 次) kind=%s target=%s", attempt, attempts, kind, target_id)
+            await asyncio.sleep(5.0)
+
+        if ok:
+            logger.info("[OttoHub] 主动发送消息成功 kind=%s target=%s", kind, target_id)
+        else:
+            logger.warning("[OttoHub] 主动发送消息失败(已重试 %d 次) kind=%s target=%s", attempts, kind, target_id)
+
+        await super().send_by_session(session, message_chain)

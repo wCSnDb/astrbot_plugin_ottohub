@@ -82,7 +82,14 @@ class OttoHubMessageEvent(AstrMessageEvent):
         clean_text = self._sanitize_outgoing_text(text or "")
         chain = CoreMessageChain([CorePlain(clean_text)])
         original_result = self.get_result()
+        # 这里手动重新触发 meme_manager 的 on_decorating_result 只是为了检测*这一段*
+        # 文本里的新表情；它读写的是和外层（真正的 on_decorating_result 正式调用）
+        # 同一个 meme_manager_pending_images extra。如果不隔离，外层为"独立消息发送"
+        # 模式暂存在这里、留给 after_message_sent 单独发送的表情图，会被这次内部调用
+        # 提前读走并强行内联合并进当前分段，导致"独立消息"选项永远失效。
+        outer_pending_images = self.get_extra("meme_manager_pending_images")
         self.set_result(MessageEventResult(chain=chain))
+        self.set_extra("meme_manager_pending_images", [])
         text_parts: list[str] = []
         image_urls: list[str] = []
         try:
@@ -105,12 +112,13 @@ class OttoHubMessageEvent(AstrMessageEvent):
                     url = await self._image_component_to_url(comp)
                     if url:
                         image_urls.append(url)
+            # 仅收集这次内部调用*新产生*的待发送表情（这里认为该场景下强制内联是可接受的
+            # 简化），外层原本暂存的表情不在此处消费，留给 after_message_sent 处理。
             pending_images = self.get_extra("meme_manager_pending_images") or []
             for comp in pending_images:
                 url = await self._image_component_to_url(comp)
                 if url:
                     image_urls.append(url)
-            self.set_extra("meme_manager_pending_images", [])
         except Exception as exc:
             logger.error("[OttoHub] Meme 处理失败: %s", exc, exc_info=True)
             return clean_text, []
@@ -119,6 +127,7 @@ class OttoHubMessageEvent(AstrMessageEvent):
                 self.set_result(original_result)
             else:
                 self.clear_result()
+            self.set_extra("meme_manager_pending_images", outer_pending_images)
         return " ".join(text_parts).strip() or clean_text, image_urls
 
     # ------------------------------------------------------------------ image handling
@@ -305,6 +314,18 @@ class OttoHubMessageEvent(AstrMessageEvent):
                 logger.debug("[OttoHub] 装饰图片无法内联到当前段，已跳过: %s", url)
         return parts
 
+    @staticmethod
+    def _apply_at_prefix_to_parts(parts: list[str], at_prefix: str) -> list[str]:
+        """给最终要发送的每一段都加上 @ 前缀，而不是只加在分段前的整体文本开头——
+        否则分段发送时，除了第一条评论外其余几条各自作为独立评论发出去，
+        看不出是在回复谁。"""
+        if not at_prefix:
+            return parts
+        return [
+            at_prefix + part if part and at_prefix.strip() not in part else part
+            for part in parts
+        ]
+
     # ------------------------------------------------------------------ decoration
 
     async def _decorate_single_text_part(self, part: str, max_len: int, *, detect_meme: bool = True) -> list[str]:
@@ -374,16 +395,14 @@ class OttoHubMessageEvent(AstrMessageEvent):
         return sent
 
     async def send(self, message: MessageChain):
-        pending_meme_images = self.get_extra("meme_manager_pending_images") or []
-        self.set_extra("meme_manager_pending_images", [])
+        # 注意：不要在此消费/清空 meme_manager_pending_images。那是 meme_manager
+        # 插件"表情包作为独立消息发送"选项自己的状态，要留给它自己的
+        # after_message_sent 钩子通过 context.send_message 单独发送；如果在这里
+        # 提前读取并内联合并，会导致该选项在 OttoHub 上永远失效（表情图会被强行
+        # 塞进本条回复里，而不是作为独立消息发出）。
         text_parts: list[str] = []
         image_urls: list[str] = []
         meme_image_urls: list[str] = []
-
-        for comp in pending_meme_images:
-            url = await self._image_component_to_url(comp)
-            if url:
-                meme_image_urls.append(url)
 
         comp_list = message.chain if hasattr(message, "chain") else message
         if not isinstance(comp_list, (list, tuple)):
@@ -406,22 +425,23 @@ class OttoHubMessageEvent(AstrMessageEvent):
                 text_parts.append(f"@{comp.qq} ")
 
         raw_text = self._sanitize_outgoing_text("".join(text_parts))
-        
+
         plugin_config = self._load_plugin_config()
+        at_prefix = ""
         if plugin_config.get("reply_with_at", False) and self.reply_type != "dm" and self.receiver_uid:
             nickname = ""
             if hasattr(self.message_obj, "sender") and self.message_obj.sender:
                 nickname = getattr(self.message_obj.sender, "nickname", "") or ""
             if not nickname:
                 nickname = "用户"
-            
+
             if plugin_config.get("use_effective_at", True):
                 at_prefix = f"@{nickname} "
             else:
                 at_prefix = f"[@{nickname}](/u/{self.receiver_uid}) "
-                
-            if at_prefix.strip() not in raw_text:
-                raw_text = at_prefix + raw_text
+            # 注意：@ 前缀不在这里一次性拼进 raw_text —— 那样分段之后就只有
+            # 第一条带 @，后面几段各自作为独立评论发出去时看不出是在回复谁。
+            # 这里只算出前缀，实际拼接放到下面按最终分段逐条附加。
 
         # LLM 报错时不输出任何固定话术：直接放弃本次回复，并在开启重新响应时交由后台重试
         is_llm_error = raw_text.startswith("LLM 响应错误") or raw_text.startswith("LLM response error")
@@ -439,8 +459,10 @@ class OttoHubMessageEvent(AstrMessageEvent):
             return
 
         max_len = self._resolve_message_limit(plugin_config)
+        # 给 @ 前缀预留长度，避免加上前缀后单条超过平台上限
+        split_max_len = max(1, max_len - len(at_prefix)) if at_prefix else max_len
         has_explicit_split = self._has_split_marker(raw_text)
-        parts = self._split_text(raw_text, max_len)
+        parts = self._split_text(raw_text, split_max_len)
 
         # 判断消息是否为指令（指令不附加 meme/emoji）
         incoming_text = ""
@@ -480,7 +502,7 @@ class OttoHubMessageEvent(AstrMessageEvent):
                 decorated_text, decorated_images = await self._apply_meme_manager(detected_text)
                 body = decorated_text or raw_text
                 meme_image_urls = decorated_images or meme_image_urls
-            truncated, did_truncate = self._truncate_to_limit(body, max_len)
+            truncated, did_truncate = self._truncate_to_limit(body, split_max_len)
             if did_truncate:
                 logger.info(
                     "[OttoHub] 已关闭自动分段，输出超过 %d 字已截断（原 %d 字）",
@@ -490,10 +512,10 @@ class OttoHubMessageEvent(AstrMessageEvent):
             final_parts = self._merge_image_parts(
                 final_parts, (meme_image_urls or []) + image_urls, max_len,
             )
+            final_parts = self._apply_at_prefix_to_parts(final_parts, at_prefix)
             logger.info("[OttoHub] 准备发送单条回复（分段关闭）type=%s", self.reply_type)
             sent += await self._dispatch_final_parts(final_parts)
             if sent > 0:
-                self.set_extra("meme_manager_pending_images", [])
                 await super().send(message)
             return
 
@@ -506,6 +528,7 @@ class OttoHubMessageEvent(AstrMessageEvent):
                 decorated_parts = await self._decorate_single_text_part(base_part, max_len, detect_meme=should_attach_meme)
                 if base_idx == len(parts) - 1:
                     decorated_parts = self._merge_image_parts(decorated_parts, image_urls, max_len)
+                decorated_parts = self._apply_at_prefix_to_parts(decorated_parts, at_prefix)
                 for part_idx, part in enumerate(decorated_parts):
                     if not part:
                         continue
@@ -543,6 +566,7 @@ class OttoHubMessageEvent(AstrMessageEvent):
             if should_attach_meme and not detect_each_part and meme_image_urls and not any("![image](" in part for part in parts):
                 parts = self._merge_image_parts(parts, meme_image_urls, max_len, allow_standalone=False)
             parts = self._merge_image_parts(parts, image_urls, max_len)
+            parts = self._apply_at_prefix_to_parts(parts, at_prefix)
             logger.info(
                 "[OttoHub] 准备发送 %d 段回复 explicit_split=%s type=%s",
                 len(parts), has_explicit_split, self.reply_type,
@@ -550,5 +574,4 @@ class OttoHubMessageEvent(AstrMessageEvent):
             sent += await self._dispatch_final_parts(parts)
 
         if sent > 0:
-            self.set_extra("meme_manager_pending_images", [])
             await super().send(message)
